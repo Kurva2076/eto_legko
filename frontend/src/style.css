@@ -50,6 +50,10 @@ button.danger { border: 0; background: none; color: var(--red); font-size: 18px;
 }
 .dropdown div { padding: 8px 10px; cursor: pointer; font-size: 14px; }
 .dropdown div:hover { background: #eef4fd; }
+.offer-picker {
+  position: relative;
+  width: 100%;
+}
 .chosen { margin-top: 6px; font-size: 13px; color: var(--green); }
 .stream { border-top: 1px solid var(--border); padding: 14px 0; }
 .stream:first-child { border-top: 0; }

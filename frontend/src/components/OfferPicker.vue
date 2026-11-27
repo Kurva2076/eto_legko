@@ -43,7 +43,7 @@ function onBlur() {
 </script>
 
 <template>
-  <div>
+  <div class="offer-picker">
     <input
       type="text"
       v-model="query"

@@ -78,7 +78,7 @@ async function submit() {
     </div>
 
     <button class="primary" :disabled="!canSubmit" @click="submit">
-      {{ loading ? 'Создаю…' : 'Create' }}
+      {{ loading ? 'Создаю...' : 'Создать' }}
     </button>
   </div>
 </template>
