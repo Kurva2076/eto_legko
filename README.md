@@ -53,6 +53,7 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 cd backend
 py -m venv .venv
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
@@ -63,11 +64,7 @@ alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
 
-Если PowerShell пишет `running scripts is disabled`, выполните один раз 
-```bash
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-или используйте cmd и активируйте окружение командой `.venv\Scripts\activate.bat`.
+Если PowerShell пишет `running scripts is disabled`, выполните один раз используйте cmd и активируйте окружение командой `.venv\Scripts\activate.bat`.
 
 Swagger: http://127.0.0.1:8000/docs
 
