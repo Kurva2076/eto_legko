@@ -55,13 +55,14 @@ button.danger { border: 0; background: none; color: var(--red); font-size: 18px;
   width: 100%;
 }
 .chosen { margin-top: 6px; font-size: 13px; color: var(--green); }
-.stream { border-top: 1px solid var(--border); padding: 14px 0; }
+.stream { border-top: 3px solid var(--border); padding: 36px 0; }
 .stream:first-child { border-top: 0; }
 .stream h3 { margin: 0 0 6px; font-size: 15px; }
-.muted { color: var(--muted); font-size: 13px; }
+.muted { color: var(--muted); font-size: 13px; text-align: center; }
 table { width: 100%; border-collapse: collapse; }
 td, th { padding: 6px 8px; text-align: left; font-size: 14px; }
 td.share { width: 110px; }
+.share-content { width: min-content; margin: auto; }
 td.share input { width: 70px; }
 .total.ok { color: var(--green); }
 .total.bad { color: var(--red); font-weight: 600; }
@@ -69,3 +70,56 @@ td.share input { width: 70px; }
 .list-item { padding: 8px 0; border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
 .list-item:first-child { border-top: 0; }
 a { color: var(--blue); }
+
+/* ---------- редактор кампании: потоки, офферы, синхронизация ---------- */
+.editor-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.editor-head h1 { margin: 0; }
+.editor-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+button.small { padding: 6px 12px; font-size: 13px; }
+button.secondary:disabled { opacity: .5; cursor: default; }
+
+.stream-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.stream-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stream-target { margin-top: 4px; font-size: 14px; }
+.offers-label { margin-top: 10px; }
+
+/* незафиксированные (не отправленные в Keitaro) изменения */
+.stream.unsynced {
+  background: #fffbea;
+  border-left: 4px solid #f0a500;
+  padding-left: 12px;
+}
+tr.changed td { background: #fff3cd; }
+
+/* удалённые офферы (REMOVED) */
+tr.removed td { color: #9aa5b1; background: #f4f6f8; }
+tr.removed .offer-name { font-style: italic; }
+td.actions { white-space: nowrap; text-align: right; }
+
+.badge {
+  display: inline-block; padding: 1px 6px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; font-style: normal; vertical-align: middle;
+}
+.badge-warn { background: #ffe8a3; color: #7a5600; }
+.badge-added { background: #d9f2e0; color: #226b38; }
+.badge-share { background: #e1ecfb; color: #1f5fb5; }
+.badge-removed { background: #e4e7eb; color: #6b7785; }
+
+.pin-btn {
+  border: 0; background: none; color: #b8c0c9; cursor: pointer;
+  padding: 2px 4px; vertical-align: middle; line-height: 0;
+}
+.pin-btn:hover { color: var(--blue); }
+.pin-btn.active { color: var(--blue); }
+.pin-btn:disabled { cursor: default; }
+
+.icon-btn {
+  display: inline-flex; gap: 4px; align-items: center;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; margin-left: 4px;
+}
+.icon-btn:disabled { opacity: .5; cursor: default; }
+.icon-btn.danger-btn { color: var(--red); }
+
+.add-offer { margin-top: 12px; }
+td.share { width: 150px; white-space: nowrap; }

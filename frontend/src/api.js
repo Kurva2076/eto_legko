@@ -19,11 +19,21 @@ async function req(method, url, body) {
 export const api = {
   meta: () => req('GET', '/meta'),
   searchOffers: (q) => req('GET', `/offers?q=${encodeURIComponent(q)}&limit=15`),
-  listCampaigns: () => req('GET', '/campaigns?limit=100'),
+
+  listCampaigns: () => req('GET', '/campaigns'),
+  syncCampaigns: () => req('POST', '/campaigns/sync'),
   createCampaign: (data) => req('POST', '/campaigns', data),
   getCampaign: (id) => req('GET', `/campaigns/${id}`),
-  addOffer: (id, offer_id) => req('POST', `/campaigns/${id}/offers`, { offer_id }),
-  removeOffer: (id, offer_id) => req('DELETE', `/campaigns/${id}/offers/${offer_id}`),
-  setShares: (id, shares) => req('PUT', `/campaigns/${id}/offers/shares`, { shares }),
-  equalize: (id) => req('POST', `/campaigns/${id}/offers/equalize`),
+  pullCampaign: (id) => req('POST', `/campaigns/${id}/pull`),
+  pushCampaign: (id) => req('POST', `/campaigns/${id}/push`),
+
+  pushStream: (streamId) => req('POST', `/streams/${streamId}/push`),
+  cancelStream: (streamId) => req('POST', `/streams/${streamId}/cancel`),
+  addOffer: (streamId, offerId) => req('POST', `/streams/${streamId}/offers`, { offer_id: offerId }),
+  removeOffer: (streamId, offerId) => req('DELETE', `/streams/${streamId}/offers/${offerId}`),
+  restoreOffer: (streamId, offerId) => req('POST', `/streams/${streamId}/offers/${offerId}/restore`),
+  purgeOffer: (streamId, offerId) => req('DELETE', `/streams/${streamId}/offers/${offerId}/purge`),
+  pinOffer: (streamId, offerId, pinned) => req('PUT', `/streams/${streamId}/offers/${offerId}/pin`, { pinned }),
+  setShares: (streamId, shares) => req('PUT', `/streams/${streamId}/offers/shares`, { shares }),
+  equalize: (streamId) => req('POST', `/streams/${streamId}/offers/equalize`),
 }
