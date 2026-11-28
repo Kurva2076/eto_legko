@@ -5,9 +5,10 @@ from sqlalchemy.orm import Session
 
 from app import services
 from app.db import get_db
+from app.errors import ServiceError
 from app.keitaro import KeitaroClient, KeitaroError, get_client
 from app.models import CampaignRecord
-from app.schemas import CampaignCreate, OfferAdd, SharesUpdate
+from app.schemas import CampaignCreate, OfferAdd, PinUpdate, SharesUpdate
 
 app = FastAPI(title='Adrobot')
 
@@ -35,6 +36,18 @@ async def keitaro_error_handler(_: Request, exception: KeitaroError) -> JSONResp
     return JSONResponse(status_code=status, content={'detail': detail})
 
 
+@app.exception_handler(ServiceError)
+async def service_error_handler(_: Request, exception: ServiceError) -> JSONResponse:
+    """
+    Перехват ошибки ServiceError и последующее формирование ошибки.
+
+    :param _: Запрос, вызвавший ошибку.
+    :param exception: Ошибка.
+    :return: Ответ с информацией о полученной ошибке.
+    """
+    return JSONResponse(status_code=exception.status, content={'detail': exception.detail})
+
+
 @app.get('/api/health')
 def health() -> JSONResponse:
     """Проверка доступности сервера"""
@@ -42,80 +55,129 @@ def health() -> JSONResponse:
 
 
 @app.get('/api/meta')
-def meta(kt: KeitaroClient = Depends(get_client)):
-    return services.resolve_defaults(kt)
+def meta(keitaro_client: KeitaroClient = Depends(get_client)):
+    return services.resolve_defaults(keitaro_client)
 
 
 @app.get('/api/offers')
-def offers(q: str = '', limit: int = Query(20, ge=1, le=100), kt: KeitaroClient = Depends(get_client)):
-    return services.search_offers(kt, q, limit)
+def offers(
+    search: str = '',
+    limit: int = Query(20, ge=1, le=100),
+    keitaro_client: KeitaroClient = Depends(get_client),
+    database: Session = Depends(get_db),
+):
+    """Поиск офферов по каталогу в БД (каталог один раз загружается из Keitaro, если он пуст)"""
+    return services.search_offers(keitaro_client, database, search, limit)
 
 
 @app.get('/api/campaigns')
-def list_campaigns(
-    offset: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
-    kt: KeitaroClient = Depends(get_client),
-):
-    items = kt.get('/campaigns', offset=offset, limit=limit) or []
-    return [
-        {'id': c['id'], 'name': c.get('name'), 'state': c.get('state'), 'alias': c.get('alias')}
-        for c in items
-    ]
+def list_campaigns(database: Session = Depends(get_db)):
+    """Список кампаний из нашей БД"""
+    return services.list_campaigns(database)
+
+
+@app.post('/api/campaigns/sync')
+def sync_campaigns(keitaro_client: KeitaroClient = Depends(get_client), database: Session = Depends(get_db)):
+    """Загрузка списка кампаний из Keitaro в БД"""
+    return services.sync_campaigns(keitaro_client, database)
 
 
 @app.post('/api/campaigns', status_code=201)
 def create_campaign(
-    data: CampaignCreate, kt: KeitaroClient = Depends(get_client), db: Session = Depends(get_db)
+    data: CampaignCreate,
+    keitaro_client: KeitaroClient = Depends(get_client),
+    database: Session = Depends(get_db),
 ):
-    return services.create_campaign(kt, db, data)
+    return services.create_campaign(keitaro_client, database, data)
 
 
 @app.get('/api/campaigns/{campaign_id}')
-def get_campaign(campaign_id: int, kt: KeitaroClient = Depends(get_client)):
-    return services.campaign_view(kt, campaign_id)
+def get_campaign(campaign_id: int, database: Session = Depends(get_db)):
+    """Кампания с потоками и офферами, только из БД"""
+    return services.campaign_view(database, campaign_id)
 
 
-@app.post('/api/campaigns/{campaign_id}/offers')
-def add_offer(
+@app.post('/api/campaigns/{campaign_id}/pull')
+def pull_campaign(
     campaign_id: int,
-    body: OfferAdd,
-    kt: KeitaroClient = Depends(get_client),
-    db: Session = Depends(get_db),
+    keitaro_client: KeitaroClient = Depends(get_client),
+    database: Session = Depends(get_db),
 ):
-    return services.add_offer(kt, db, campaign_id, body.offer_id)
+    """Стянуть кампанию, потоки и офферы из Keitaro в БД"""
+    return services.pull_campaign(keitaro_client, database, campaign_id)
 
 
-@app.delete('/api/campaigns/{campaign_id}/offers/{offer_id}')
-def remove_offer(
+@app.post('/api/campaigns/{campaign_id}/push')
+def push_campaign(
     campaign_id: int,
-    offer_id: int,
-    kt: KeitaroClient = Depends(get_client),
-    db: Session = Depends(get_db),
+    keitaro_client: KeitaroClient = Depends(get_client),
+    database: Session = Depends(get_db),
 ):
-    return services.remove_offer(kt, db, campaign_id, offer_id)
+    """Отправить в Keitaro изменения всех потоков кампании"""
+    return services.push_campaign(keitaro_client, database, campaign_id)
 
 
-@app.put('/api/campaigns/{campaign_id}/offers/shares')
-def update_shares(
-    campaign_id: int,
-    body: SharesUpdate,
-    kt: KeitaroClient = Depends(get_client),
-    db: Session = Depends(get_db),
+@app.post('/api/streams/{stream_id}/push')
+def push_stream(
+    stream_id: int,
+    keitaro_client: KeitaroClient = Depends(get_client),
+    database: Session = Depends(get_db),
 ):
-    return services.set_shares(kt, db, campaign_id, body.shares)
+    """Отправить в Keitaro изменения одного потока"""
+    return services.push_stream(keitaro_client, database, stream_id)
 
 
-@app.post('/api/campaigns/{campaign_id}/offers/equalize')
-def equalize(
-    campaign_id: int, kt: KeitaroClient = Depends(get_client), db: Session = Depends(get_db)
-):
-    return services.equalize(kt, db, campaign_id)
+@app.post('/api/streams/{stream_id}/cancel')
+def cancel_stream_changes(stream_id: int, database: Session = Depends(get_db)):
+    """Отменить незафиксированные изменения потока"""
+    return services.cancel_stream_changes(database, stream_id)
+
+
+@app.post('/api/streams/{stream_id}/offers')
+def add_offer(stream_id: int, body: OfferAdd, database: Session = Depends(get_db)):
+    """Добавить оффер в поток (только в БД)"""
+    return services.add_offer(database, stream_id, body.offer_id)
+
+
+@app.put('/api/streams/{stream_id}/offers/shares')
+def update_shares(stream_id: int, body: SharesUpdate, database: Session = Depends(get_db)):
+    """Задать доли офферов потока (только в БД)"""
+    return services.set_shares(database, stream_id, body.shares)
+
+
+@app.post('/api/streams/{stream_id}/offers/equalize')
+def equalize(stream_id: int, database: Session = Depends(get_db)):
+    """Распределить доли незакреплённых офферов поровну (только в БД)"""
+    return services.equalize(database, stream_id)
+
+
+@app.delete('/api/streams/{stream_id}/offers/{offer_id}')
+def remove_offer(stream_id: int, offer_id: int, database: Session = Depends(get_db)):
+    """Пометить оффер как REMOVED (только в БД)"""
+    return services.remove_offer(database, stream_id, offer_id)
+
+
+@app.post('/api/streams/{stream_id}/offers/{offer_id}/restore')
+def restore_offer(stream_id: int, offer_id: int, database: Session = Depends(get_db)):
+    """Восстановить оффер со статусом REMOVED (только в БД)"""
+    return services.restore_offer(database, stream_id, offer_id)
+
+
+@app.delete('/api/streams/{stream_id}/offers/{offer_id}/purge')
+def purge_offer(stream_id: int, offer_id: int, database: Session = Depends(get_db)):
+    """Полностью удалить оффер со статусом REMOVED из БД"""
+    return services.purge_offer(database, stream_id, offer_id)
+
+
+@app.put('/api/streams/{stream_id}/offers/{offer_id}/pin')
+def pin_offer(stream_id: int, offer_id: int, body: PinUpdate, database: Session = Depends(get_db)):
+    """Закрепить или открепить долю оффера"""
+    return services.set_pinned(database, stream_id, offer_id, body.pinned)
 
 
 @app.get('/api/created')
-def created(db: Session = Depends(get_db)):
-    rows = db.query(CampaignRecord).order_by(CampaignRecord.id.desc()).limit(100).all()
+def created(database: Session = Depends(get_db)):
+    rows = database.query(CampaignRecord).order_by(CampaignRecord.id.desc()).limit(100).all()
     return [
         {
             'keitaro_id': r.keitaro_id,

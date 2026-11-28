@@ -39,3 +39,7 @@ class ShareItem(BaseModel):
 
 class SharesUpdate(BaseModel):
     shares: list[ShareItem]
+
+
+class PinUpdate(BaseModel):
+    pinned: bool

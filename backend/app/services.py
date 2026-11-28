@@ -1,11 +1,27 @@
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.enums import OfferChangeActionType, OfferStatus
+from app.errors import ServiceError
 from app.keitaro import KeitaroClient, KeitaroError
-from app.models import CampaignRecord, OfferChange
+from app.models import Campaign, CampaignRecord, Offer, OfferChange, Stream, StreamOffer
 from app.schemas import CampaignCreate, ShareItem
+from app.stream_logic import (
+    LANDINGS_SCHEMA,
+    TOTAL_SHARE,
+    active_offers,
+    has_unsynced_changes,
+    offer_change_kind,
+    offers_payload,
+    recalculate_shares,
+    total_share,
+)
+from app.utils import now, to_utc_iso
 
 GOOGLE_URL = 'https://google.com'
+CAMPAIGNS_PAGE_SIZE = 100
+CAMPAIGNS_MAX_OFFSET = 5000
 
 
 def _pick(items: list[dict], wanted_id: int, label: str) -> dict:
@@ -43,21 +59,48 @@ def resolve_defaults(keitaro: KeitaroClient) -> dict:
     }
 
 
-def search_offers(keitaro: KeitaroClient, search: str, limit: int = 20) -> list[dict]:
+def _sync_offers_catalog(keitaro: KeitaroClient, database: Session) -> None:
     """
-    Ищет офферы по подстроке в названии или по точному совпадению ID (для автокомплита).
+    Обновляет каталог офферов в БД данными из Keitaro (новые добавляются, названия обновляются).
+    Изменения только добавляются в сессию (flush), коммит делает вызывающий код.
 
     :param keitaro: Клиент Keitaro Admin API.
-    :param search: Поисковая строка. Если она пустая, возвращаются первые офферы списка.
+    :param database: Сессия БД.
+    """
+    existing = {offer.id: offer for offer in database.scalars(select(Offer))}
+    for remote_offer in keitaro.offers(time_to_leave=0):
+        offer_id = int(remote_offer['id'])
+        name = str(remote_offer.get('name', ''))
+        offer = existing.get(offer_id)
+        if offer is None:
+            database.add(Offer(id=offer_id, name=name))
+        else:
+            offer.name = name
+    database.flush()
+
+
+def search_offers(keitaro: KeitaroClient, database: Session, search: str, limit: int = 20) -> list[dict]:
+    """
+    Ищет офферы в каталоге нашей БД по подстроке в названии или по точному совпадению ID
+    (для автокомплита). Если каталог ещё пуст, он один раз загружается из Keitaro.
+
+    :param keitaro: Клиент Keitaro Admin API.
+    :param database: Сессия БД.
+    :param search: Поисковая строка. Если она пустая, возвращаются первые офферы каталога.
     :param limit: Максимальное количество офферов в результате.
     :return: Список словарей с полями id и name.
     """
+    catalog = database.scalars(select(Offer).order_by(Offer.id)).all()
+    if not catalog:
+        _sync_offers_catalog(keitaro, database)
+        database.commit()
+        catalog = database.scalars(select(Offer).order_by(Offer.id)).all()
+
     search = (search or '').strip().lower()
     result = []
-    for offer in keitaro.offers():
-        name = str(offer.get('name', ''))
-        if not search or search in name.lower() or search == str(offer.get('id')):
-            result.append({'id': offer['id'], 'name': name})
+    for offer in catalog:
+        if not search or search in offer.name.lower() or search == str(offer.id):
+            result.append({'id': offer.id, 'name': offer.name})
             if len(result) >= limit:
                 break
     return result
@@ -81,11 +124,91 @@ def equal_shares(offer_ids: list[int]) -> list[dict]:
     ]
 
 
+def _upsert_campaign(
+    database: Session,
+    remote_campaign: dict,
+    existing: dict[int, Campaign] | None = None,
+) -> Campaign:
+    """
+    Создаёт или обновляет кампанию в БД по данным из Keitaro.
+
+    :param database: Сессия БД.
+    :param remote_campaign: Данные кампании из Keitaro.
+    :param existing: Уже загруженные кампании «Keitaro ID — кампания», чтобы не делать запрос
+        на каждую кампанию. Если не передано, кампания ищется запросом в БД.
+    :return: Кампания из БД (новая добавляется в сессию, но не коммитится).
+    """
+    keitaro_id = int(remote_campaign['id'])
+    if existing is not None:
+        campaign = existing.get(keitaro_id)
+    else:
+        campaign = database.scalar(select(Campaign).where(Campaign.keitaro_id == keitaro_id))
+    if campaign is None:
+        campaign = Campaign(keitaro_id=keitaro_id, name='')
+        database.add(campaign)
+        if existing is not None:
+            existing[keitaro_id] = campaign
+    campaign.name = str(remote_campaign.get('name') or campaign.name or f'#{keitaro_id}')
+    campaign.alias = remote_campaign.get('alias') or campaign.alias
+    campaign.state = remote_campaign.get('state') or campaign.state
+    return campaign
+
+
+def list_campaigns(database: Session) -> list[dict]:
+    """
+    Возвращает список кампаний из нашей БД, новые сверху.
+
+    :param database: Сессия БД.
+    :return: Список словарей с полями id (ID в Keitaro), name, state, alias и synced_at.
+    """
+    campaigns = database.scalars(select(Campaign).order_by(Campaign.keitaro_id.desc()))
+    return [
+        {
+            'id': campaign.keitaro_id,
+            'name': campaign.name,
+            'state': campaign.state,
+            'alias': campaign.alias,
+            'synced_at': to_utc_iso(campaign.synced_at),
+        }
+        for campaign in campaigns
+    ]
+
+
+def sync_campaigns(keitaro: KeitaroClient, database: Session) -> list[dict]:
+    """
+    Загружает список кампаний из Keitaro в нашу БД (потоки при этом не затрагиваются).
+
+    :param keitaro: Клиент Keitaro Admin API.
+    :param database: Сессия БД.
+    :return: Обновлённый список кампаний из БД (см. list_campaigns).
+    """
+    remote_campaigns: list[dict] = []
+    seen_ids: set[int] = set()
+    offset = 0
+    while offset < CAMPAIGNS_MAX_OFFSET:
+        page = keitaro.get('/campaigns', offset=offset, limit=CAMPAIGNS_PAGE_SIZE) or []
+        new_items = [item for item in page if int(item['id']) not in seen_ids]
+        if not new_items:
+            break
+        seen_ids.update(int(item['id']) for item in new_items)
+        remote_campaigns.extend(new_items)
+        if len(page) < CAMPAIGNS_PAGE_SIZE:
+            break
+        offset += CAMPAIGNS_PAGE_SIZE
+
+    existing = {campaign.keitaro_id: campaign for campaign in database.scalars(select(Campaign))}
+    for remote_campaign in remote_campaigns:
+        _upsert_campaign(database, remote_campaign, existing)
+    database.commit()
+    return list_campaigns(database)
+
+
 def create_campaign(keitaro: KeitaroClient, database: Session, data: CampaignCreate) -> dict:
     """
     Создаёт кампанию с двумя потоками: первый отправляет выбранные страны на Google,
     второй ведёт на выбранный оффер. Домен, группа и источник берутся из справочников.
-    Если потоки создать не удалось, кампания удаляется из Keitaro.
+    Если потоки создать не удалось, кампания удаляется из Keitaro. Созданная кампания
+    сохраняется в БД вместе с потоками, чтобы её можно было сразу открыть в редакторе.
 
     :param keitaro: Клиент Keitaro Admin API.
     :param database: Сессия БД, в которую записывается созданная кампания.
@@ -129,13 +252,12 @@ def create_campaign(keitaro: KeitaroClient, database: Session, data: CampaignCre
                 'campaign_id': campaign_id,
                 'name': 'Офферы',
                 'type': 'default',
-                'schema': 'landings',
+                'schema': LANDINGS_SCHEMA,
                 'position': 2,
                 'offers': equal_shares([data.offer_id]),
             },
         )
     except KeitaroError:
-        # не оставляем «полусобранную» кампанию
         try:
             keitaro.delete(f'/campaigns/{campaign_id}')
         except KeitaroError:
@@ -143,7 +265,12 @@ def create_campaign(keitaro: KeitaroClient, database: Session, data: CampaignCre
         raise
 
     database.add(CampaignRecord(keitaro_id=campaign_id, name=data.name, geo=data.geo, offer_id=data.offer_id))
+    _upsert_campaign(database, {**campaign, 'name': campaign.get('name') or data.name})
     database.commit()
+    try:
+        pull_campaign(keitaro, database, campaign_id)
+    except KeitaroError:
+        database.rollback()
     return {
         'id': campaign_id,
         'name': data.name,
@@ -154,211 +281,532 @@ def create_campaign(keitaro: KeitaroClient, database: Session, data: CampaignCre
     }
 
 
-def _offer_names(keitaro: KeitaroClient) -> dict[int, str]:
+def _get_campaign(database: Session, campaign_id: int) -> Campaign:
     """
-    Собирает соответствие ID оффера и его названия.
+    Получает кампанию из БД по её ID в Keitaro.
 
-    :param keitaro: Клиент Keitaro Admin API.
-    :return: Словарь, где ключ — ID оффера, значение — его название.
+    :param database: Сессия БД.
+    :param campaign_id: ID кампании в Keitaro.
+    :return: Кампания из БД.
+    :raises: ServiceError: Кампании нет в БД.
     """
-    return {int(o['id']): str(o.get('name', '')) for o in keitaro.offers()}
+    campaign = database.scalar(select(Campaign).where(Campaign.keitaro_id == campaign_id))
+    if campaign is None:
+        raise ServiceError(404, 'Кампании нет в БД. Нажмите «Обновить список» и выберите кампанию заново')
+    return campaign
 
 
-def _streams(keitaro: KeitaroClient, campaign_id: int) -> list[dict]:
+def _get_stream(database: Session, stream_id: int) -> Stream:
     """
-    Получает потоки кампании в порядке их позиций.
+    Получает поток из БД по его ID в Keitaro.
 
-    :param keitaro: Клиент Keitaro Admin API.
-    :param campaign_id: ID кампании.
-    :return: Список потоков кампании. Если потоков нет, возвращается пустой список.
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :return: Поток из БД.
+    :raises: ServiceError: Потока нет в БД.
     """
-    return keitaro.get(f'/campaigns/{campaign_id}/streams') or []
+    stream = database.scalar(select(Stream).where(Stream.keitaro_id == stream_id))
+    if stream is None:
+        raise ServiceError(404, 'Потока нет в БД. Стяните потоки кампании с Keitaro')
+    return stream
 
 
-def _offers_stream(streams: list[dict]) -> dict | None:
+def _get_offer_row(stream: Stream, offer_id: int) -> StreamOffer:
     """
-    Находит поток с офферами. Сначала ищется поток типа default со схемой landings,
-    затем любой поток со схемой landings.
+    Находит оффер в потоке (в том числе помеченный как REMOVED).
 
-    :param streams: Список потоков кампании.
-    :return: Найденный поток или None, если в кампании нет потока с офферами.
+    :param stream: Поток из БД.
+    :param offer_id: ID оффера в Keitaro.
+    :return: Оффер потока.
+    :raises: ServiceError: Оффера нет в потоке.
     """
-    for stream in streams:
-        if stream.get('type') == 'default' and stream.get('schema') == 'landings':
-            return stream
-    for stream in streams:
-        if stream.get('schema') == 'landings':
-            return stream
-    return None
+    for row in stream.offers:
+        if row.offer_id == offer_id:
+            return row
+    raise ServiceError(404, 'Такого оффера нет в потоке')
 
 
-def _stream_offers(stream: dict | None) -> list[dict]:
+def _stream_view(stream: Stream) -> dict:
     """
-    Возвращает офферы потока.
+    Собирает данные потока для редактора. Активные офферы идут первыми, удалённые (REMOVED) — в конце.
 
-    :param stream: Поток кампании или None.
-    :return: Копия списка офферов потока. Если потока нет, возвращается пустой список.
+    :param stream: Поток из БД.
+    :return: Словарь с полями потока, его офферами, суммой долей и признаком незафиксированных изменений.
     """
-    return list(stream.get('offers') or []) if stream else []
-
-
-def campaign_view(keitaro: KeitaroClient, campaign_id: int) -> dict:
-    """
-    Собирает данные кампании для редактора: сама кампания, её потоки и офферы с названиями.
-
-    :param keitaro: Клиент Keitaro Admin API.
-    :param campaign_id: ID кампании.
-    :return: Словарь с полями кампании (id, name, state, alias, admin_url), потоками (streams)
-        и ID потока с офферами (offers_stream_id, None, если такого потока нет).
-    """
-    campaign = keitaro.get(f'/campaigns/{campaign_id}')
-    streams = _streams(keitaro, campaign_id)
-    names = _offer_names(keitaro)
-    offers_stream = _offers_stream(streams)
-
-    out_streams = []
-    for stream in streams:
-        out_streams.append(
+    synced_by_id = {item['offer_id']: item for item in stream.synced_offers or []}
+    offers = sorted(stream.offers, key=lambda offer: offer.status == OfferStatus.REMOVED)
+    offer_views = []
+    for offer in offers:
+        change = offer_change_kind(offer, synced_by_id)
+        offer_views.append(
             {
-                'id': stream['id'],
-                'name': stream.get('name'),
-                'type': stream.get('type'),
-                'schema': stream.get('schema'),
-                'state': stream.get('state'),
-                'action_type': stream.get('action_type'),
-                'action_payload': stream.get('action_payload'),
-                'filters': stream.get('filters') or [],
-                'offers': [
-                    {
-                        'offer_id': int(offer['offer_id']),
-                        'name': names.get(int(offer['offer_id']), f'#{offer["offer_id"]}'),
-                        'share': offer.get('share', 0),
-                        'state': offer.get('state', 'active'),
-                    }
-                    for offer in (stream.get('offers') or [])
-                ],
+                'offer_id': offer.offer_id,
+                'name': offer.name,
+                'share': offer.share,
+                'pinned': offer.pinned,
+                'status': offer.status.value,
+                'change': change.value if change else None,
             }
         )
     return {
-        'id': campaign['id'],
-        'name': campaign.get('name'),
-        'state': campaign.get('state'),
-        'alias': campaign.get('alias'),
-        'admin_url': f'{settings.admin_base}/admin/#!/campaign.editor/{campaign["id"]}',
-        'offers_stream_id': offers_stream['id'] if offers_stream else None,
-        'streams': out_streams,
+        'id': stream.keitaro_id,
+        'name': stream.name,
+        'type': stream.type,
+        'schema': stream.schema,
+        'state': stream.state,
+        'position': stream.position,
+        'action_type': stream.action_type,
+        'action_payload': stream.action_payload,
+        'filters': stream.filters or [],
+        'has_offers': bool(stream.offers),
+        'has_changes': has_unsynced_changes(
+            stream.offers, stream.schema, stream.synced_offers or [], stream.synced_schema
+        ),
+        'total_share': total_share(stream.offers),
+        'offers': offer_views,
     }
 
 
-def _save_offers(keitaro: KeitaroClient, campaign_id: int, stream: dict | None, offers: list[dict]) -> None:
+def campaign_view(database: Session, campaign_id: int) -> dict:
     """
-    Сохраняет состав офферов потока целиком. Если потока с офферами нет, он создаётся.
+    Собирает данные кампании для редактора только из БД (в Keitaro запросов нет).
+    Сначала идут потоки с офферами, потом потоки без них.
+
+    :param database: Сессия БД.
+    :param campaign_id: ID кампании в Keitaro.
+    :return: Словарь с полями кампании, временем последней синхронизации (synced_at),
+        признаком незафиксированных изменений (has_changes) и списком потоков (streams).
+    """
+    campaign = _get_campaign(database, campaign_id)
+    streams = sorted(
+        campaign.streams,
+        key=lambda stream: (0 if stream.offers else 1, stream.position, stream.id),
+    )
+    stream_views = [_stream_view(stream) for stream in streams]
+    return {
+        'id': campaign.keitaro_id,
+        'name': campaign.name,
+        'state': campaign.state,
+        'alias': campaign.alias,
+        'admin_url': f'{settings.admin_base}/admin/#!/campaign.editor/{campaign.keitaro_id}',
+        'synced_at': to_utc_iso(campaign.synced_at),
+        'has_changes': any(view['has_changes'] for view in stream_views),
+        'streams': stream_views,
+    }
+
+
+def _load_stream_details(keitaro: KeitaroClient, remote_stream: dict) -> dict:
+    """
+    Возвращает поток вместе с офферами и фильтрами. Если в элементе списка потоков кампании
+    их нет, поток дозапрашивается отдельным запросом.
 
     :param keitaro: Клиент Keitaro Admin API.
-    :param campaign_id: ID кампании.
-    :param stream: Поток с офферами или None, если его нужно создать.
-    :param offers: Новый состав офферов потока (offer_id, share, state).
+    :param remote_stream: Поток из списка потоков кампании.
+    :return: Поток с полями offers и filters.
     """
-    if stream is None:
-        keitaro.post(
-            '/streams',
-            {
-                'campaign_id': campaign_id,
-                'name': 'Офферы',
-                'type': 'default',
-                'schema': 'landings',
-                'offers': offers,
-            },
-        )
-    else:
-        keitaro.put(f'/streams/{stream["id"]}', {'offers': offers})
+    if 'offers' in remote_stream and 'filters' in remote_stream:
+        return remote_stream
+    return keitaro.get(f'/streams/{remote_stream["id"]}') or remote_stream
 
 
-def add_offer(keitaro: KeitaroClient, database: Session, campaign_id: int, offer_id: int) -> dict:
+def _replace_stream_offers(stream: Stream, remote_offers: list[dict], catalog: dict[int, str]) -> None:
     """
-    Добавляет оффер в кампанию и распределяет доли между всеми офферами поровну.
+    Приводит офферы потока в БД к состоянию в Keitaro:
+     - локальные незафиксированные изменения перезаписываются;
+     - удалённые локально (REMOVED) офферы, которых нет в Keitaro, сохраняются в БД, чтобы их можно было восстановить;
+     - удалённые офферы через Keitaro помечаются как REMOVED, но не удаляются.
+
+    :param stream: Поток из БД.
+    :param remote_offers: Офферы потока из Keitaro.
+    :param catalog: Каталог офферов «ID оффера — название».
+    """
+    remote_by_id = {
+        int(remote_offer['offer_id']): {
+            'offer_id': int(remote_offer['offer_id']),
+            'share': int(remote_offer.get('share') or 0),
+            'state': remote_offer.get('state') or 'active',
+        }
+        for remote_offer in remote_offers
+        if remote_offer.get('offer_id') is not None
+    }
+
+    for row in stream.offers:
+        remote_offer = remote_by_id.get(row.offer_id)
+        if remote_offer is not None:
+            row.status = OfferStatus.ACTIVE
+            row.share = remote_offer['share']
+            row.keitaro_state = remote_offer['state']
+            row.name = catalog.get(row.offer_id, row.name)
+        elif row.status == OfferStatus.ACTIVE:
+            row.status = OfferStatus.REMOVED
+
+    existing_ids = {row.offer_id for row in stream.offers}
+    for offer_id, remote_offer in remote_by_id.items():
+        if offer_id not in existing_ids:
+            stream.offers.append(
+                StreamOffer(
+                    offer_id=offer_id,
+                    name=catalog.get(offer_id, f'#{offer_id}'),
+                    share=remote_offer['share'],
+                    pinned=False,
+                    keitaro_state=remote_offer['state'],
+                    status=OfferStatus.ACTIVE,
+                )
+            )
+    stream.synced_offers = list(remote_by_id.values())
+
+
+def pull_campaign(keitaro: KeitaroClient, database: Session, campaign_id: int) -> dict:
+    """
+    Стягивает кампанию, её потоки и офферы из Keitaro в БД. Это единственное место, где редактор
+    читает потоки из Keitaro. Локальные незафиксированные изменения потоков перезаписываются.
+    Все запросы к Keitaro выполняются до записи в БД, поэтому при ошибке БД не меняется.
 
     :param keitaro: Клиент Keitaro Admin API.
-    :param database: Сессия БД, в которую записывается изменение.
-    :param campaign_id: ID кампании.
-    :param offer_id: ID добавляемого оффера.
-    :return: Обновлённые данные кампании (см. campaign_view).
-    :raises: KeitaroError: Оффер не существует или оффер уже есть в кампании.
+    :param database: Сессия БД.
+    :param campaign_id: ID кампании в Keitaro.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
     """
-    keitaro.offer(offer_id)  # проверка существования
-    stream = _offers_stream(_streams(keitaro, campaign_id))
-    ids = [int(o['offer_id']) for o in _stream_offers(stream)]
-    if offer_id in ids:
-        raise KeitaroError(409, 'Оффер уже есть в кампании')
-    _save_offers(keitaro, campaign_id, stream, equal_shares(ids + [offer_id]))
-    database.add(OfferChange(campaign_id=campaign_id, offer_id=offer_id, action='add'))
+    remote_campaign = keitaro.get(f'/campaigns/{campaign_id}')
+    remote_streams = [
+        _load_stream_details(keitaro, remote_stream)
+        for remote_stream in (keitaro.get(f'/campaigns/{campaign_id}/streams') or [])
+    ]
+    _sync_offers_catalog(keitaro, database)
+    catalog = {offer.id: offer.name for offer in database.scalars(select(Offer))}
+
+    campaign = _upsert_campaign(database, remote_campaign)
+    campaign.synced_at = now()
+
+    local_streams = {stream.keitaro_id: stream for stream in campaign.streams}
+    remote_ids: set[int] = set()
+    for index, remote_stream in enumerate(remote_streams, start=1):
+        stream_id = int(remote_stream['id'])
+        remote_ids.add(stream_id)
+        stream = local_streams.get(stream_id)
+        if stream is None:
+            stream = Stream(keitaro_id=stream_id, name='')
+            campaign.streams.append(stream)
+        action_payload = remote_stream.get('action_payload')
+        stream.name = str(remote_stream.get('name') or f'#{stream_id}')
+        stream.type = remote_stream.get('type')
+        stream.schema = remote_stream.get('schema')
+        stream.synced_schema = stream.schema
+        stream.state = remote_stream.get('state')
+        stream.position = int(remote_stream.get('position') or index)
+        stream.action_type = remote_stream.get('action_type')
+        stream.action_payload = None if action_payload is None else str(action_payload)
+        stream.filters = remote_stream.get('filters') or []
+        _replace_stream_offers(stream, remote_stream.get('offers') or [], catalog)
+
+    for stream_id, stream in local_streams.items():
+        if stream_id not in remote_ids:
+            campaign.streams.remove(stream)
+
     database.commit()
-    return campaign_view(keitaro, campaign_id)
+    return campaign_view(database, campaign_id)
 
 
-def remove_offer(keitaro: KeitaroClient, db: Session, campaign_id: int, offer_id: int) -> dict:
+def _validate_stream_shares(stream: Stream) -> None:
     """
-    Удаляет оффер из кампании и распределяет доли между оставшимися офферами поровну.
+    Проверяет, что сумма долей активных офферов потока равна 100 (или офферов в потоке нет).
+
+    :param stream: Поток из БД.
+    :raises: ServiceError: Сумма долей не равна 100.
+    """
+    total = total_share(stream.offers)
+    if active_offers(stream.offers) and total != TOTAL_SHARE:
+        raise ServiceError(
+            422,
+            f'В потоке «{stream.name}» сумма долей равна {total}%, а должна быть {TOTAL_SHARE}%',
+        )
+
+
+def _push_stream_changes(keitaro: KeitaroClient, database: Session, stream: Stream) -> None:
+    """
+    Отправляет изменения одного потока в Keitaro и после успеха считает их зафиксированными.
+    Состав офферов потока в Keitaro заменяется целиком (удалённые офферы в него не попадают).
+    Если у потока нет изменений, ничего не делает.
 
     :param keitaro: Клиент Keitaro Admin API.
-    :param db: Сессия БД, в которую записывается изменение.
-    :param campaign_id: ID кампании.
-    :param offer_id: ID удаляемого оффера.
-    :return: Обновлённые данные кампании (см. campaign_view).
-    :raises: KeitaroError: Оффера нет в кампании.
+    :param database: Сессия БД.
+    :param stream: Поток из БД.
     """
-    stream = _offers_stream(_streams(keitaro, campaign_id))
-    ids = [int(offer['offer_id']) for offer in _stream_offers(stream)]
-    if offer_id not in ids:
-        raise KeitaroError(404, 'Такого оффера нет в кампании')
-    rest = [i for i in ids if i != offer_id]
-    _save_offers(keitaro, campaign_id, stream, equal_shares(rest))
-    db.add(OfferChange(campaign_id=campaign_id, offer_id=offer_id, action='remove'))
-    db.commit()
-    return campaign_view(keitaro, campaign_id)
+    if not has_unsynced_changes(stream.offers, stream.schema, stream.synced_offers or [], stream.synced_schema):
+        return
+    _validate_stream_shares(stream)
+
+    offers = offers_payload(stream.offers)
+    body: dict = {'offers': offers}
+    if stream.schema != stream.synced_schema:
+        body['schema'] = stream.schema
+    keitaro.put(f'/streams/{stream.keitaro_id}', body)
+
+    stream.synced_schema = stream.schema
+    stream.synced_offers = offers
+    database.add(
+        OfferChange(
+            campaign_id=stream.campaign.keitaro_id,
+            stream_id=stream.keitaro_id,
+            offer_id=0,
+            action=OfferChangeActionType.PUSH,
+        )
+    )
+    database.commit()
 
 
-def set_shares(keitaro: KeitaroClient, database: Session, campaign_id: int, items: list[ShareItem]) -> dict:
+def push_stream(keitaro: KeitaroClient, database: Session, stream_id: int) -> dict:
     """
-    Задаёт доли офферов вручную.
+    Отправляет в Keitaro локальные изменения одного потока.
 
     :param keitaro: Клиент Keitaro Admin API.
-    :param database: Сессия БД, в которую записывается изменение.
-    :param campaign_id: ID кампании.
-    :param items: Список пар «оффер — доля» для всех офферов кампании.
-    :return: Обновлённые данные кампании (см. campaign_view).
-    :raises: KeitaroError: Список офферов не совпадает с текущим составом кампании или сумма долей не равна 100.
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
     """
-    stream = _offers_stream(_streams(keitaro, campaign_id))
-    current = {int(offer['offer_id']): offer for offer in _stream_offers(stream)}
+    stream = _get_stream(database, stream_id)
+    campaign_id = stream.campaign.keitaro_id
+    _push_stream_changes(keitaro, database, stream)
+    return campaign_view(database, campaign_id)
+
+
+def push_campaign(keitaro: KeitaroClient, database: Session, campaign_id: int) -> dict:
+    """
+    Отправляет в Keitaro локальные изменения всех потоков кампании. Сначала проверяются доли во всех
+    изменённых потоках, и только потом начинается отправка, поэтому из-за ошибки в долях не отправится ничего.
+    Если Keitaro вернёт ошибку посреди отправки, уже отправленные потоки остаются зафиксированными.
+
+    :param keitaro: Клиент Keitaro Admin API.
+    :param database: Сессия БД.
+    :param campaign_id: ID кампании в Keitaro.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    """
+    campaign = _get_campaign(database, campaign_id)
+    changed_streams = [
+        stream
+        for stream in sorted(campaign.streams, key=lambda item: (item.position, item.id))
+        if has_unsynced_changes(stream.offers, stream.schema, stream.synced_offers or [], stream.synced_schema)
+    ]
+    for stream in changed_streams:
+        _validate_stream_shares(stream)
+    for stream in changed_streams:
+        _push_stream_changes(keitaro, database, stream)
+    return campaign_view(database, campaign_id)
+
+
+def _commit_change(
+    database: Session,
+    stream: Stream,
+    offer_id: int,
+    action: OfferChangeActionType,
+) -> dict:
+    """
+    Записывает действие в журнал, коммитит изменения и возвращает обновлённую кампанию.
+
+    :param database: Сессия БД.
+    :param stream: Изменённый поток.
+    :param offer_id: ID оффера, с которым выполнено действие (0, если действие относится ко всему потоку).
+    :param action: Выполненное действие.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    """
+    campaign_id = stream.campaign.keitaro_id
+    database.add(
+        OfferChange(campaign_id=campaign_id, stream_id=stream.keitaro_id, offer_id=offer_id, action=action)
+    )
+    database.commit()
+    return campaign_view(database, campaign_id)
+
+
+def add_offer(database: Session, stream_id: int, offer_id: int) -> dict:
+    """
+    Добавляет оффер в поток (только в БД) и пересчитывает доли незакреплённых офферов. Если оффер
+    уже есть в потоке со статусом REMOVED, он восстанавливается. Если поток не был потоком
+    с офферами (схема не landings), он становится таким при добавлении оффера.
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param offer_id: ID добавляемого оффера.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока нет в БД, оффер уже есть в потоке или оффера нет в каталоге.
+    """
+    stream = _get_stream(database, stream_id)
+    row = next((item for item in stream.offers if item.offer_id == offer_id), None)
+    if row is not None and row.status == OfferStatus.ACTIVE:
+        raise ServiceError(409, 'Оффер уже есть в потоке')
+    if row is None:
+        catalog_offer = database.get(Offer, offer_id)
+        if catalog_offer is None:
+            raise ServiceError(404, 'Оффера нет в каталоге. Стяните потоки с Keitaro, чтобы обновить каталог')
+        row = StreamOffer(offer_id=offer_id, name=catalog_offer.name, share=0, keitaro_state='active')
+        stream.offers.append(row)
+    row.status = OfferStatus.ACTIVE
+    row.pinned = False
+    if stream.schema != LANDINGS_SCHEMA:
+        stream.schema = LANDINGS_SCHEMA
+    recalculate_shares(stream.offers)
+    return _commit_change(database, stream, offer_id, OfferChangeActionType.ADD)
+
+
+def remove_offer(database: Session, stream_id: int, offer_id: int) -> dict:
+    """
+    Помечает оффер потока как REMOVED (из БД он не стирается), снимает с него закрепление
+    и пересчитывает доли незакреплённых офферов.
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param offer_id: ID оффера.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока или оффера нет в БД, либо оффер уже помечен как REMOVED.
+    """
+    stream = _get_stream(database, stream_id)
+    row = _get_offer_row(stream, offer_id)
+    if row.status == OfferStatus.REMOVED:
+        raise ServiceError(409, 'Оффер уже удалён из потока')
+    row.status = OfferStatus.REMOVED
+    row.pinned = False
+    recalculate_shares(stream.offers)
+    return _commit_change(database, stream, offer_id, OfferChangeActionType.REMOVE)
+
+
+def restore_offer(database: Session, stream_id: int, offer_id: int) -> dict:
+    """
+    Восстанавливает оффер со статусом REMOVED и пересчитывает доли незакреплённых офферов.
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param offer_id: ID оффера.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока или оффера нет в БД, либо оффер не помечен как REMOVED.
+    """
+    stream = _get_stream(database, stream_id)
+    row = _get_offer_row(stream, offer_id)
+    if row.status != OfferStatus.REMOVED:
+        raise ServiceError(409, 'Оффер не был удалён из потока')
+    row.status = OfferStatus.ACTIVE
+    row.pinned = False
+    recalculate_shares(stream.offers)
+    return _commit_change(database, stream, offer_id, OfferChangeActionType.RESTORE)
+
+
+def purge_offer(database: Session, stream_id: int, offer_id: int) -> dict:
+    """
+    Окончательно удаляет из БД оффер со статусом REMOVED. Если такой оффер ещё присутствует в Keitaro,
+    его удаление из потока остаётся незафиксированным изменением (его можно отправить или отменить).
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param offer_id: ID оффера.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока или оффера нет в БД, либо оффер не помечен как REMOVED.
+    """
+    stream = _get_stream(database, stream_id)
+    row = _get_offer_row(stream, offer_id)
+    if row.status != OfferStatus.REMOVED:
+        raise ServiceError(409, 'Полностью удалить можно только оффер со статусом REMOVED')
+    stream.offers.remove(row)
+    return _commit_change(database, stream, offer_id, OfferChangeActionType.PURGE)
+
+
+def set_pinned(database: Session, stream_id: int, offer_id: int, pinned: bool) -> dict:
+    """
+    Закрепляет или открепляет текущую долю оффера. Закреплённые офферы не участвуют в пересчёте долей
+    при добавлении, удалении и восстановлении офферов.
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param offer_id: ID оффера.
+    :param pinned: True — закрепить долю, False — открепить.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока или оффера нет в БД, либо оффер помечен как REMOVED.
+    """
+    stream = _get_stream(database, stream_id)
+    row = _get_offer_row(stream, offer_id)
+    if row.status != OfferStatus.ACTIVE:
+        raise ServiceError(409, 'Нельзя закрепить долю удалённого оффера')
+    row.pinned = pinned
+    action = OfferChangeActionType.PIN if pinned else OfferChangeActionType.UNPIN
+    return _commit_change(database, stream, offer_id, action)
+
+
+def set_shares(database: Session, stream_id: int, items: list[ShareItem]) -> dict:
+    """
+    Задаёт доли офферов потока вручную (только в БД).
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :param items: Список пар «оффер — доля» для всех активных офферов потока.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    :raises:
+        ServiceError: Потока нет в БД, список офферов не совпадает с активными офферами потока
+            или сумма долей не равна 100.
+    """
+    stream = _get_stream(database, stream_id)
+    current = {row.offer_id: row for row in active_offers(stream.offers)}
     given = {item.offer_id: item.share for item in items}
     if set(given) != set(current):
-        raise KeitaroError(422, 'Список офферов не совпадает с текущим составом кампании')
-    if current and sum(given.values()) != 100:
-        raise KeitaroError(422, f'Сумма долей должна быть 100, сейчас {sum(given.values())}')
-    offers = [
-        {'offer_id': offer_id, 'share': given[offer_id], 'state': current[offer_id].get('state', 'active')}
-        for offer_id in current
-    ]
-    _save_offers(keitaro, campaign_id, stream, offers)
-    database.add(OfferChange(campaign_id=campaign_id, offer_id=0, action='shares'))
-    database.commit()
-    return campaign_view(keitaro, campaign_id)
+        raise ServiceError(422, 'Список офферов не совпадает с текущим составом потока')
+    if current and sum(given.values()) != TOTAL_SHARE:
+        raise ServiceError(422, f'Сумма долей должна быть {TOTAL_SHARE}, сейчас {sum(given.values())}')
+    for offer_id, row in current.items():
+        row.share = given[offer_id]
+    return _commit_change(database, stream, 0, OfferChangeActionType.SHARES)
 
 
-def equalize(keitaro: KeitaroClient, database: Session, campaign_id: int) -> dict:
+def equalize(database: Session, stream_id: int) -> dict:
     """
-    Распределяет доли между офферами кампании поровну. Если офферов нет, ничего не меняет.
+    Распределяет доли между незакреплёнными офферами потока поровну (только в БД).
+    Закреплённые офферы сохраняют свою долю. Если незакреплённых офферов нет, доли не меняются.
 
-    :param keitaro: Клиент Keitaro Admin API.
-    :param database: Сессия БД (в этой функции не используется).
-    :param campaign_id: ID кампании.
-    :return: Актуальные данные кампании (см. campaign_view).
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
     """
-    stream = _offers_stream(_streams(keitaro, campaign_id))
-    ids = [int(offer['offer_id']) for offer in _stream_offers(stream)]
-    if stream is not None and ids:
-        _save_offers(keitaro, campaign_id, stream, equal_shares(ids))
-    database.add(OfferChange(campaign_id=campaign_id, offer_id=0, action='equalize'))
-    database.commit()
-    return campaign_view(keitaro, campaign_id)
+    stream = _get_stream(database, stream_id)
+    recalculate_shares(stream.offers)
+    return _commit_change(database, stream, 0, OfferChangeActionType.EQUALIZE)
+
+
+def cancel_stream_changes(database: Session, stream_id: int) -> dict:
+    """
+    Отменяет локальные незафиксированные изменения потока и возвращает его к состоянию
+    на момент последней синхронизации с Keitaro: возвращает доли, восстанавливает офферы,
+    убирает добавленные и возвращает схему потока. Офферы со статусом REMOVED, которых не было
+    в Keitaro, остаются в БД. Закрепления долей сохраняются.
+
+    :param database: Сессия БД.
+    :param stream_id: ID потока в Keitaro.
+    :return: Актуальные данные кампании из БД (см. campaign_view).
+    """
+    stream = _get_stream(database, stream_id)
+    synced_by_id = {item['offer_id']: item for item in stream.synced_offers or []}
+    catalog = {offer.id: offer.name for offer in database.scalars(select(Offer))}
+
+    for row in list(stream.offers):
+        synced_offer = synced_by_id.get(row.offer_id)
+        if synced_offer is not None:
+            row.status = OfferStatus.ACTIVE
+            row.share = synced_offer['share']
+            row.keitaro_state = synced_offer['state']
+        elif row.status == OfferStatus.ACTIVE:
+            stream.offers.remove(row)
+
+    existing_ids = {row.offer_id for row in stream.offers}
+    for offer_id, synced_offer in synced_by_id.items():
+        if offer_id not in existing_ids:
+            stream.offers.append(
+                StreamOffer(
+                    offer_id=offer_id,
+                    name=catalog.get(offer_id, f'#{offer_id}'),
+                    share=synced_offer['share'],
+                    pinned=False,
+                    keitaro_state=synced_offer['state'],
+                    status=OfferStatus.ACTIVE,
+                )
+            )
+    stream.schema = stream.synced_schema
+    return _commit_change(database, stream, 0, OfferChangeActionType.CANCEL)
